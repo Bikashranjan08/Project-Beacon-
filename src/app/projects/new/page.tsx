@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import { AppShell } from "@/components/layout/app-shell"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -25,6 +25,7 @@ import {
 import Link from "next/link"
 import { useRouter } from "next/navigation"
 import { useAppStore } from "@/store/app-store"
+import { useAuth } from "@/lib/auth-context"
 import type { ProjectType, StatusConfig } from "@/lib/types"
 import { toast } from "sonner"
 
@@ -39,8 +40,16 @@ const iconMap: Record<string, React.ElementType> = {
 
 export default function NewProjectPage() {
   const router = useRouter()
-  const { addProject } = useAppStore()
+  const { user, isLoaded: isAuthLoaded } = useAuth()
+  const { addProject, initializeStore } = useAppStore()
   const [step, setStep] = useState<"type" | "details">("type")
+
+  useEffect(() => {
+    if (user) {
+      initializeStore(user)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user])
   const [selectedType, setSelectedType] = useState<string | null>(null)
   const [projectName, setProjectName] = useState("")
   // BUG-025 FIXED: description is now passed to addProject
@@ -126,8 +135,9 @@ export default function NewProjectPage() {
       )
       toast.success(`Project "${newProj.name}" created successfully!`)
       router.push(`/projects/${newProj.id}`)
-    } catch {
-      toast.error("Failed to create project")
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to create project"
+      toast.error(message)
     } finally {
       setIsCreating(false)
     }
@@ -361,7 +371,7 @@ export default function NewProjectPage() {
               </Button>
               <Button
                 type="submit"
-                disabled={isCreating}
+                disabled={isCreating || !isAuthLoaded}
                 className="flex-1 bg-gradient-to-r from-gold to-gold-dark text-navy hover:brightness-110"
               >
                 {isCreating ? "Creating..." : "Create Project"}

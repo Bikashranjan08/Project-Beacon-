@@ -3,6 +3,8 @@
 import React, { createContext, useContext, useState, useEffect } from "react"
 import { useRouter } from "next/navigation"
 import { createClient } from "@/lib/supabase/client"
+import { ensureWorkspaceExists, isMissingColumnError } from "@/lib/supabase/workspace"
+import { useAppStore } from "@/store/app-store"
 import { toast } from "sonner"
 import type { Role } from "@/lib/types"
 
@@ -22,7 +24,7 @@ type AuthContextType = {
   loading: boolean
   isLoaded: boolean
   loginAsIndependent: (email: string, password: string) => Promise<void>
-  signUpAsIndependent: (email: string, password: string, fullName: string) => Promise<void>
+  signUpAsIndependent: (email: string, password: string, fullName: string) => Promise<{ needsEmailConfirmation?: boolean } | void>
   loginAsTeamMember: (email: string, code: string) => Promise<void>
   signOut: () => Promise<void>
   refreshSession: () => Promise<void>
@@ -55,6 +57,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter()
   const supabase = createClient()
 
+  const syncUser = (nextUser: AuthUser | null) => {
+    setUser(nextUser)
+    useAppStore.getState().setUser(nextUser)
+  }
+
   const checkSession = async () => {
     try {
       // 1. Check Team Member cookie session first
@@ -62,7 +69,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       if (teamSessionStr) {
         try {
           const teamSession = JSON.parse(teamSessionStr)
-          setUser({
+          syncUser({
             id: `team-${teamSession.email}-${teamSession.organizationId}`,
             email: teamSession.email,
             fullName: teamSession.email.split("@")[0],
@@ -114,10 +121,17 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           }
         }
 
+        const displayName =
+          profile?.full_name ||
+          session.user.user_metadata?.full_name ||
+          session.user.email?.split("@")[0] ||
+          "Independent User"
+
         // Fetch user's workspace (created during seeding or workspace creation)
         let resolvedWorkspaceId = session.user.id
+        let hasWorkspaceRow = false
         try {
-          const { data: userWs } = await supabase
+          const { data: userWs, error: wsLookupError } = await supabase
             .from("workspaces")
             .select("id")
             .eq("owner_id", session.user.id)
@@ -127,39 +141,64 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
           if (userWs?.id) {
             resolvedWorkspaceId = userWs.id
+            hasWorkspaceRow = true
           } else {
-            // Also check workspace_members table
-            const { data: memberWs } = await supabase
-              .from("workspace_members")
-              .select("workspace_id")
-              .eq("user_id", session.user.id)
-              .order("created_at", { ascending: true })
-              .limit(1)
-              .maybeSingle()
+            // Fallback for base schemas without workspaces.owner_id: look up by user.id directly
+            if (isMissingColumnError(wsLookupError)) {
+              const { data: directWs } = await supabase
+                .from("workspaces")
+                .select("id")
+                .eq("id", session.user.id)
+                .maybeSingle()
 
-            if (memberWs?.workspace_id) {
-              resolvedWorkspaceId = memberWs.workspace_id
+              if (directWs?.id) {
+                resolvedWorkspaceId = directWs.id
+                hasWorkspaceRow = true
+              }
             }
+
+            if (!hasWorkspaceRow) {
+              const { data: memberWs, error: memberWsError } = await supabase
+                .from("workspace_members")
+                .select("workspace_id")
+                .eq("user_id", session.user.id)
+                .order("created_at", { ascending: true })
+                .limit(1)
+                .maybeSingle()
+
+              if (!memberWsError && memberWs?.workspace_id) {
+                resolvedWorkspaceId = memberWs.workspace_id
+                hasWorkspaceRow = true
+              }
+            }
+          }
+
+          if (!hasWorkspaceRow) {
+            await ensureWorkspaceExists(
+              supabase,
+              resolvedWorkspaceId,
+              `${displayName}'s Workspace`
+            )
           }
         } catch (wsErr) {
           console.warn("Could not query user workspace, using user.id:", wsErr)
         }
 
-        setUser({
+        syncUser({
           id: session.user.id,
           email: session.user.email || "",
-          fullName: profile?.full_name || session.user.user_metadata?.full_name || session.user.email?.split("@")[0] || "Independent User",
+          fullName: displayName,
           avatarUrl: profile?.avatar_url || null,
           role: "OWNER", // Independent users are OWNERS of their workspace
           isTeamMember: false,
           organizationId: resolvedWorkspaceId, // Dynamically resolved workspace ID
         })
       } else {
-        setUser(null)
+        syncUser(null)
       }
     } catch (error) {
       console.error("Error checking auth session:", error)
-      setUser(null)
+      syncUser(null)
     } finally {
       setLoading(false)
       setIsLoaded(true)
@@ -172,7 +211,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     // Listen for Supabase auth state changes
     const { data: { subscription } } = supabase.auth.onAuthStateChange(async (event, session) => {
       if (event === "SIGNED_OUT") {
-        setUser(null)
+        syncUser(null)
       } else if (session?.user) {
         // Only trigger checkSession if not currently logged in as a team member
         const teamSessionStr = getCookie("projtrack_team_session")
@@ -223,8 +262,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setLoading(true)
     deleteCookie("projtrack_team_session")
 
+    const normalizedEmail = email.trim().toLowerCase()
     const { data, error } = await supabase.auth.signUp({
-      email,
+      email: normalizedEmail,
       password,
       options: {
         data: {
@@ -238,18 +278,28 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       throw error
     }
 
-    if (data.user) {
-      // Create profile in profiles table
+    if (data.user && data.session) {
+      // Create profile and default workspace while authenticated
       await supabase.from("profiles").upsert({
         id: data.user.id,
-        email: email,
+        email: normalizedEmail,
         full_name: fullName,
         created_at: new Date().toISOString(),
       })
+
+      await ensureWorkspaceExists(
+        supabase,
+        data.user.id,
+        `${fullName || normalizedEmail.split("@")[0] || "My"}'s Workspace`
+      )
+
+      await checkSession()
+      window.location.href = "/dashboard"
+      return { needsEmailConfirmation: false }
     }
 
-    await checkSession()
-    window.location.href = "/dashboard"
+    setLoading(false)
+    return { needsEmailConfirmation: true }
   }
 
   const loginAsTeamMember = async (email: string, code: string) => {
@@ -312,7 +362,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setCookie("projtrack_team_session", JSON.stringify(sessionData), 7)
     
     // Set user state
-    setUser({
+    syncUser({
       id: `team-${invitation.email}-${invitation.organization_id}`,
       email: invitation.email,
       fullName: invitation.email.split("@")[0],
@@ -333,7 +383,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setLoading(true)
     deleteCookie("projtrack_team_session")
     await supabase.auth.signOut()
-    setUser(null)
+    syncUser(null)
     setLoading(false)
     window.location.href = "/login"
   }

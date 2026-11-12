@@ -81,7 +81,7 @@ export function ProjectHealthCard({
           <div className="mt-4 flex items-center justify-between">
             <div className="flex items-center gap-1.5 text-[11px] text-muted-foreground">
               <Calendar className="h-3.5 w-3.5" />
-              {deadline ? (
+              {deadline && !Number.isNaN(new Date(deadline).getTime()) ? (
                 <span>Due {formatDistanceToNow(new Date(deadline), { addSuffix: true })}</span>
               ) : (
                 <span>No deadline</span>

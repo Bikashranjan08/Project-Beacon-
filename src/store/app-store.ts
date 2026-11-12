@@ -1,6 +1,11 @@
 import { create } from "zustand"
 import type { Project, Task, ProjectType, StatusConfig, Priority, HealthStatus } from "@/lib/types"
 import { createClient } from "@/lib/supabase/client"
+import {
+  ensureWorkspaceExists,
+  isNetworkError,
+  isSupabaseConfigured,
+} from "@/lib/supabase/workspace"
 import { toast } from "sonner"
 import { io } from "socket.io-client"
 
@@ -104,7 +109,45 @@ const mapDbTaskToTask = (t: any): Task => {
   }
 }
 
-const mapDbProjectToProject = (p: any): Project => {
+const VALID_HEALTH_STATUSES: HealthStatus[] = ["ON_TRACK", "AT_RISK", "CRITICAL"]
+const VALID_PROJECT_TYPES: ProjectType[] = ["SOFTWARE", "CONSTRUCTION", "EVENT", "MARKETING", "RESEARCH", "GENERAL"]
+
+function toSafeIsoDate(dateStr?: string | null): string | null {
+  if (!dateStr) return null
+  const trimmed = dateStr.trim()
+  if (!trimmed) return null
+
+  const ddmmyyyy = trimmed.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/)
+  if (ddmmyyyy) {
+    const [, d, m, y] = ddmmyyyy
+    const utcDate = new Date(Date.UTC(Number(y), Number(m) - 1, Number(d)))
+    if (!Number.isNaN(utcDate.getTime())) {
+      return utcDate.toISOString()
+    }
+  }
+
+  const parsed = new Date(trimmed)
+  if (!Number.isNaN(parsed.getTime())) {
+    return parsed.toISOString()
+  }
+  return null
+}
+
+function toDisplayDateString(dateStr?: string | null): string | null {
+  const iso = toSafeIsoDate(dateStr)
+  return iso ? iso.split("T")[0] : null
+}
+
+function toSupabaseActionError(action: string, error: { code?: string; message?: string }): Error {
+  if (error.code === "42501") {
+    return new Error(
+      `Database permission denied while ${action} (RLS policy). Please run schema.sql in Supabase SQL Editor.`
+    )
+  }
+  return new Error(error.message || `Failed to ${action} in database`)
+}
+
+const mapDbProjectToProject = (p: Record<string, unknown>, matchedLocal?: Project): Project => {
   let dbStatuses: StatusConfig[] = []
   if (p.status_config) {
     try {
@@ -113,23 +156,34 @@ const mapDbProjectToProject = (p: any): Project => {
         : (p.status_config as StatusConfig[])
     } catch { /* ignore */ }
   }
+
+  const rawHealth = String(p.color || "").toUpperCase()
+  const sanitizedHealth: HealthStatus = VALID_HEALTH_STATUSES.includes(rawHealth as HealthStatus)
+    ? (rawHealth as HealthStatus)
+    : "ON_TRACK"
+
+  const rawType = String(p.status || "").toUpperCase()
+  const sanitizedType: ProjectType = VALID_PROJECT_TYPES.includes(rawType as ProjectType)
+    ? (rawType as ProjectType)
+    : (matchedLocal?.project_type || "SOFTWARE")
+
   return {
-    id: p.id,
+    id: p.id as string,
     portfolio_id: null,
-    organization_id: p.workspace_id || "personal",
-    name: p.name,
-    description: p.description || "",
-    project_type: p.status || "SOFTWARE",
+    organization_id: (p.workspace_id as string) || "personal",
+    name: p.name as string,
+    description: (p.description as string) || matchedLocal?.description || "",
+    project_type: sanitizedType,
     budget: null,
-    deadline: p.deadline || null,
+    deadline: toDisplayDateString(p.deadline as string | null) || matchedLocal?.deadline || null,
     client_name: null,
     location: null,
-    health_status: p.color || "ON_TRACK",
+    health_status: sanitizedHealth,
     is_completed: p.status === "COMPLETED",
     custom_fields: null,
-    status_config: dbStatuses,
-    created_at: p.created_at,
-    updated_at: p.updated_at
+    status_config: dbStatuses.length > 0 ? dbStatuses : (matchedLocal?.status_config || []),
+    created_at: p.created_at as string,
+    updated_at: p.updated_at as string
   }
 }
 
@@ -347,47 +401,9 @@ export const useAppStore = create<AppState>((set, get) => ({
             .in("id", uniqueProjectIds)
 
           if (assignedProjects && assignedProjects.length > 0) {
-            const mappedAssigned: Project[] = assignedProjects.map((p: Record<string, unknown>) => {
-              let dbStatuses: StatusConfig[] = []
-              if (p.status_config) {
-                try {
-                  dbStatuses = typeof p.status_config === "string"
-                    ? JSON.parse(p.status_config)
-                    : (p.status_config as StatusConfig[])
-                } catch { /* ignore */ }
-              }
-              const validHealthStatuses = ["ON_TRACK", "AT_RISK", "CRITICAL"]
-              const validProjectTypes = ["SOFTWARE", "CONSTRUCTION", "EVENT", "MARKETING", "RESEARCH"]
-              
-              const rawHealth = String(p.color || "").toUpperCase()
-              const sanitizedHealth: HealthStatus = validHealthStatuses.includes(rawHealth) 
-                ? (rawHealth as HealthStatus) 
-                : "ON_TRACK"
-
-              const rawType = String(p.status || "").toUpperCase()
-              const sanitizedType: ProjectType = validProjectTypes.includes(rawType)
-                ? (rawType as ProjectType)
-                : "SOFTWARE"
-
-              return {
-                id: p.id as string,
-                portfolio_id: null,
-                organization_id: (p.workspace_id as string) || "personal",
-                name: p.name as string,
-                description: (p.description as string) || "",
-                project_type: sanitizedType,
-                budget: null,
-                deadline: (p.deadline as string) || null,
-                client_name: null,
-                location: null,
-                health_status: sanitizedHealth,
-                is_completed: p.status === "COMPLETED",
-                custom_fields: null,
-                status_config: dbStatuses,
-                created_at: p.created_at as string,
-                updated_at: p.updated_at as string
-              }
-            })
+            const mappedAssigned: Project[] = assignedProjects.map((p: Record<string, unknown>) =>
+              mapDbProjectToProject(p)
+            )
 
             const { data: assignedTasks } = await supabase
               .from("tasks")
@@ -451,12 +467,17 @@ export const useAppStore = create<AppState>((set, get) => ({
       // ─────────────────────────────────────────────────────────────────────────
 
       // Fetch projects - for admin/independent users
-      // Check both the resolved workspaceId and currentUser.id (valid UUIDs only) to guarantee match
-      const isUuid = (str: string | undefined | null): boolean => 
+      // Include resolved workspaceId (unless generic "personal") and currentUser.id (if UUID)
+      const isUuid = (str: string | undefined | null): boolean =>
         Boolean(str && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str))
 
-      const workspaceFilters = Array.from(new Set([workspaceId, currentUser?.id])).filter(isUuid)
-      
+      const workspaceFilters = Array.from(
+        new Set([
+          workspaceId !== "personal" ? workspaceId : null,
+          isUuid(currentUser?.id) ? currentUser.id : null,
+        ])
+      ).filter((id): id is string => Boolean(id))
+
       let dbProjects: any[] = []
       let projError: any = null
 
@@ -469,59 +490,19 @@ export const useAppStore = create<AppState>((set, get) => ({
         dbProjects = res.data || []
         projError = res.error
       } else {
-        const res = await supabase.from("projects").select("*")
+        const res = await supabase
+          .from("projects")
+          .select("*")
+          .eq("workspace_id", workspaceId)
         dbProjects = res.data || []
         projError = res.error
       }
-      
+
       if (!projError && dbProjects) {
         // Map DB projects to frontend Projects structure
         const syncedProjects: Project[] = dbProjects.map((p: Record<string, unknown>) => {
           const matchedLocal = projects.find((lp) => lp.id === p.id)
-          
-          // Parse status_config from DB if it exists, otherwise fallback to local or empty
-          let dbStatuses: StatusConfig[] = []
-          if (p.status_config) {
-            try {
-              dbStatuses = typeof p.status_config === "string" 
-                ? JSON.parse(p.status_config) 
-                : (p.status_config as StatusConfig[])
-            } catch (e) {
-              console.error("Failed to parse status_config", e)
-            }
-          }
-
-          const validHealthStatuses = ["ON_TRACK", "AT_RISK", "CRITICAL"]
-          const validProjectTypes = ["SOFTWARE", "CONSTRUCTION", "EVENT", "MARKETING", "RESEARCH"]
-          
-          const rawHealth = String(p.color || "").toUpperCase()
-          const sanitizedHealth: HealthStatus = validHealthStatuses.includes(rawHealth) 
-            ? (rawHealth as HealthStatus) 
-            : "ON_TRACK"
-
-          const rawType = String(p.status || "").toUpperCase()
-          const sanitizedType: ProjectType = validProjectTypes.includes(rawType)
-            ? (rawType as ProjectType)
-            : (matchedLocal?.project_type || "SOFTWARE")
-
-          return {
-            id: p.id as string,
-            portfolio_id: null,
-            organization_id: (p.workspace_id as string) || "personal",
-            name: p.name as string,
-            description: (p.description as string) || matchedLocal?.description || "",
-            project_type: sanitizedType,
-            budget: null,
-            deadline: (p.deadline as string) || matchedLocal?.deadline || null,
-            client_name: null,
-            location: null,
-            health_status: sanitizedHealth,
-            is_completed: p.status === "COMPLETED",
-            custom_fields: null,
-            status_config: dbStatuses.length > 0 ? dbStatuses : (matchedLocal?.status_config || []),
-            created_at: p.created_at as string,
-            updated_at: p.updated_at as string
-          }
+          return mapDbProjectToProject(p, matchedLocal)
         })
 
         // Fetch tasks
@@ -634,11 +615,30 @@ export const useAppStore = create<AppState>((set, get) => ({
   // BUG-025 FIXED: Accept description param and set it on newProject
   // BUG-026 FIXED: Accept deadline param so user can set a real deadline
   addProject: async (name: string, type: ProjectType, statuses: StatusConfig[], description?: string, deadline?: string) => {
-    const currentUser = get().user
+    const supabase = createClient()
+    let currentUser = get().user
+
+    // Defensive recovery if user wasn't synced into store yet (e.g., direct navigation to /projects/new)
+    if (!currentUser && isSupabaseConfigured()) {
+      const { data: { session } } = await supabase.auth.getSession()
+      if (session?.user) {
+        currentUser = {
+          id: session.user.id,
+          email: session.user.email || "",
+          fullName: session.user.user_metadata?.full_name || session.user.email?.split("@")[0] || "Independent User",
+          role: "OWNER",
+          isTeamMember: false,
+          organizationId: session.user.id,
+        }
+        set({ user: currentUser })
+      }
+    }
+
     if (currentUser?.isTeamMember) {
       throw new Error("Team members cannot create projects.")
     }
-    const workspaceId = currentUser?.organizationId || "personal"
+    const workspaceId = currentUser?.organizationId || currentUser?.id || "personal"
+    const defaultDeadline = new Date(Date.now() + 30 * 86400000).toISOString().split("T")[0]
 
     const newProject: Project = {
       id: generateUUID(),
@@ -648,7 +648,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       description: description || "",
       project_type: type,
       budget: null,
-      deadline: deadline || new Date(Date.now() + 30 * 86400000).toLocaleDateString(),
+      deadline: toDisplayDateString(deadline) || defaultDeadline,
       client_name: null,
       location: null,
       health_status: "ON_TRACK",
@@ -659,40 +659,61 @@ export const useAppStore = create<AppState>((set, get) => ({
       updated_at: new Date().toISOString()
     }
 
-    const updatedProjects = [...get().projects, newProject]
-    const updatedTasks = { ...get().tasks, [newProject.id]: [] }
+    const previousProjects = get().projects
+    const previousTasks = get().tasks
+    const updatedProjects = [...previousProjects, newProject]
+    const updatedTasks = { ...previousTasks, [newProject.id]: [] }
 
     // Instant local save
     set({ projects: updatedProjects, tasks: updatedTasks })
     localStorage.setItem(`projtrack_projects_${workspaceId}`, JSON.stringify(updatedProjects))
     localStorage.setItem(`projtrack_tasks_${workspaceId}`, JSON.stringify(updatedTasks))
 
-    // Background Supabase upsert
-    try {
-      const supabase = createClient()
-      // Ensure the workspace record exists (idempotent)
-      await supabase.from("workspaces").upsert({
-        id: workspaceId,
-        owner_id: workspaceId,
-        name: `${currentUser?.fullName || currentUser?.email || "My"}'s Workspace`,
-        plan_tier: "free",
-        created_at: new Date().toISOString(),
-        updated_at: new Date().toISOString()
-      }, { onConflict: "id", ignoreDuplicates: true })
+    if (!isSupabaseConfigured()) {
+      return newProject
+    }
 
-      await supabase.from("projects").upsert({
+    // Persist to Supabase
+    try {
+      const workspaceName = `${currentUser?.fullName || currentUser?.email || "My"}'s Workspace`
+      const { error: wsError } = await ensureWorkspaceExists(supabase, workspaceId, workspaceName)
+      if (wsError) {
+        if (isNetworkError(wsError)) {
+          console.warn("Supabase workspace save offline, cached in LocalStorage", wsError)
+          return newProject
+        }
+        throw toSupabaseActionError("initializing your workspace", wsError)
+      }
+
+      const { error: projError } = await supabase.from("projects").upsert({
         id: newProject.id,
         workspace_id: workspaceId,
         name: newProject.name,
         color: newProject.health_status,
         status: newProject.project_type,
         description: newProject.description,
-        deadline: newProject.deadline,
+        deadline: toSafeIsoDate(newProject.deadline),
         status_config: statuses // save columns in DB
       })
+
+      if (projError) {
+        if (isNetworkError(projError)) {
+          console.warn("Supabase project save offline, cached in LocalStorage", projError)
+          return newProject
+        }
+        throw toSupabaseActionError("creating project", projError)
+      }
+
       await logActivity(newProject.id, null, "project_created", newProject.name)
     } catch (e) {
-      console.warn("Supabase save failed, cached in LocalStorage", e)
+      if (isNetworkError(e)) {
+        console.warn("Supabase save failed, cached in LocalStorage", e)
+        return newProject
+      }
+      set({ projects: previousProjects, tasks: previousTasks })
+      localStorage.setItem(`projtrack_projects_${workspaceId}`, JSON.stringify(previousProjects))
+      localStorage.setItem(`projtrack_tasks_${workspaceId}`, JSON.stringify(previousTasks))
+      throw e
     }
 
     return newProject
@@ -907,7 +928,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       await supabase.from("projects").update({
         name,
         description,
-        deadline,
+        deadline: toSafeIsoDate(deadline),
         color: healthStatus,
         status: isCompleted !== undefined ? (isCompleted ? "COMPLETED" : "SOFTWARE") : undefined,
         updated_at: new Date().toISOString()

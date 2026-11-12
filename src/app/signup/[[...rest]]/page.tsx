@@ -2,6 +2,7 @@
 
 import React, { useState } from "react"
 import { useAuth } from "@/lib/auth-context"
+import { useRouter } from "next/navigation"
 import { Shield, Mail, Lock, User, ArrowRight } from "lucide-react"
 import Link from "next/link"
 import { Input } from "@/components/ui/input"
@@ -11,6 +12,7 @@ import { toast } from "sonner"
 
 export default function SignupPage() {
   const { signUpAsIndependent } = useAuth()
+  const router = useRouter()
   const [email, setEmail] = useState("")
   const [fullName, setFullName] = useState("")
   const [password, setPassword] = useState("")
@@ -30,8 +32,15 @@ export default function SignupPage() {
 
     setIsLoading(true)
     try {
-      await signUpAsIndependent(email, password, fullName)
-      toast.success("Account created successfully!")
+      const result = await signUpAsIndependent(email, password, fullName)
+      if (result?.needsEmailConfirmation) {
+        toast.success("Account created! Please check your email to confirm your account, then sign in.", {
+          duration: 8000,
+        })
+        router.push("/login")
+      } else {
+        toast.success("Account created successfully!")
+      }
     } catch (err: any) {
       toast.error(err.message || "Failed to create account. Please try again.")
     } finally {
